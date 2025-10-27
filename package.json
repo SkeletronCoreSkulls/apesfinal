@@ -1,0 +1,13 @@
+{
+  "name": "x402apes-backend",
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node -e \"This is a serverless project. Use `vercel dev`.\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.15.0"
+  },
+  "engines": { "node": ">=18" }
+}
