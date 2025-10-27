@@ -31,7 +31,64 @@ const nft = (NFT_CONTRACT_ADDRESS && wallet)
 const processedTxs = new Set();
 const PRICE = BigInt(X402_PRICE_USDC || '10000000'); // 10 USDC por defecto
 
-// -------- helpers --------
+// ---------- helpers ----------
+function x402Response() {
+  return {
+    x402Version: Number(X402_VERSION || 1),
+    accepts: [
+      {
+        scheme: "exact",
+        network: X402_NETWORK || "base",
+        maxAmountRequired: PRICE.toString(),
+        resource: X402_RESOURCE || "mint:x402apes:1",
+        description: "Mint one x402Apes NFT automatically after USDC payment confirmation.",
+        mimeType: "application/json",
+        payTo: TREASURY_ADDRESS,
+        maxTimeoutSeconds: Number(X402_MAX_TIMEOUT_SECONDS || 600),
+        asset: X402_ASSET || "USDC",
+        // sin bodyFields → la UI no pide inputs, x402 envía el txHash automáticamente
+        outputSchema: {
+          input: { type: "http", method: "POST", bodyType: "json" },
+          output: { ok: true, mintedTo: "0x...", nftTxHash: "0x...", note: "Mint completed." }
+        },
+        extra: { project: "x402Apes", autoConfirm: true, onePerPayment: true }
+      }
+    ]
+  };
+}
+
+function extractTxHash(req) {
+  // 1) JSON body { txHash: "0x..." }
+  if (req.body && typeof req.body === 'object' && typeof req.body.txHash === 'string') {
+    return req.body.txHash;
+  }
+  // 2) raw body as string (algunos clientes envían text/plain)
+  if (typeof req.body === 'string') {
+    const s = req.body.trim();
+    if (s.startsWith('0x') && s.length === 66) return s;
+    try {
+      const maybe = JSON.parse(s);
+      if (maybe && typeof maybe.txHash === 'string') return maybe.txHash;
+    } catch {}
+  }
+  // 3) headers comunes
+  const h = (name) => {
+    const v = req.headers[name];
+    return Array.isArray(v) ? v[0] : v;
+  };
+  const fromHeader = h('x-402-txhash') || h('x-402-tx-hash') || h('x-tx-hash');
+  if (typeof fromHeader === 'string') return fromHeader;
+
+  // 4) query string (fallback)
+  if (typeof req.query?.txHash === 'string') return req.query.txHash;
+
+  return null;
+}
+
+function isValidTxHash(tx) {
+  return typeof tx === 'string' && /^0x[0-9a-fA-F]{64}$/.test(tx);
+}
+
 async function verifyUsdcPayment(txHash) {
   const receipt = await provider.getTransactionReceipt(txHash);
   if (!receipt) throw new Error('Transaction not found');
@@ -59,38 +116,12 @@ async function verifyUsdcPayment(txHash) {
   return ethers.getAddress(payer);
 }
 
-function x402Response() {
-  return {
-    x402Version: Number(X402_VERSION || 1),
-    accepts: [
-      {
-        scheme: "exact",
-        network: X402_NETWORK || "base",
-        maxAmountRequired: PRICE.toString(),
-        resource: X402_RESOURCE || "mint:x402apes:1",
-        description: "Mint one x402Apes NFT automatically after USDC payment confirmation.",
-        mimeType: "application/json",
-        payTo: TREASURY_ADDRESS,
-        maxTimeoutSeconds: Number(X402_MAX_TIMEOUT_SECONDS || 600),
-        asset: X402_ASSET || "USDC",
-        // SIN bodyFields → la UI no pedirá inputs
-        outputSchema: {
-          input: { type: "http", method: "POST", bodyType: "json" },
-          output: { ok: true, mintedTo: "0x...", nftTxHash: "0x...", note: "Mint completed." }
-        },
-        extra: { project: "x402Apes", autoConfirm: true, onePerPayment: true }
-      }
-    ]
-  };
-}
-
-// -------- handler --------
+// ---------- handler ----------
 export default async function handler(req, res) {
   try {
     if (req.method === 'GET') {
-      // Para x402scan: discovery debe responder 402
       res.setHeader('Content-Type', 'application/json');
-      return res.status(402).json(x402Response());
+      return res.status(402).json(x402Response()); // requerido por x402scan
     }
 
     if (req.method === 'POST') {
@@ -101,17 +132,24 @@ export default async function handler(req, res) {
         });
       }
 
-      // x402scan nos envía el txHash del pago en el body
-      const { resource, txHash } = req.body || {};
-      if (!txHash) return res.status(400).json({ error: 'Missing txHash' });
-      if (resource && resource !== (X402_RESOURCE || 'mint:x402apes:1')) {
+      // aceptar resource si viene, pero no obligarlo
+      if (req.body?.resource && req.body.resource !== (X402_RESOURCE || 'mint:x402apes:1')) {
         return res.status(400).json({ error: 'Invalid resource' });
+      }
+
+      // --- txHash robusto ---
+      const txHash = extractTxHash(req);
+      if (!isValidTxHash(txHash)) {
+        return res.status(400).json({
+          error: 'Missing txHash',
+          hint: 'x402 will send txHash automatically after payment; if testing, send in JSON body, header x-402-txhash, or ?txHash='
+        });
       }
       if (processedTxs.has(txHash)) {
         return res.status(200).json({ ok: true, note: 'Already processed', txHash });
       }
 
-      // signer debe ser el owner del contrato (onlyOwner)
+      // --- onlyOwner sanity check para evitar revert ---
       const onchainOwner = await nft.owner();
       if (onchainOwner.toLowerCase() !== wallet.address.toLowerCase()) {
         return res.status(400).json({
@@ -121,10 +159,8 @@ export default async function handler(req, res) {
         });
       }
 
-      // verificar pago USDC → treasury y obtener payer
+      // verificar pago y mintear 1 NFT al payer
       const payer = await verifyUsdcPayment(txHash);
-
-      // mintear 1 al payer
       const tx = await nft.mintAfterPayment(payer, 1, { gasLimit: 300000n });
       const rec = await tx.wait();
 
